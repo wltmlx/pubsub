@@ -80,6 +80,8 @@ public class Prober {
     String endpoint = new String("pubsub.googleapis.com:443");
     String topicName = new String("");
     String subscriptionName = new String("");
+    boolean shouldCleanup = true;
+    boolean noPublish = false;
     SubscriptionType subscriptionType = SubscriptionType.STREAMING_PULL;
     double messageFailureProbability = 0.0;
     long publishFrequency = 1_000_000L;
@@ -102,6 +104,16 @@ public class Prober {
 
     public Builder setEndpoint(String endpoint) {
       this.endpoint = endpoint;
+      return this;
+    }
+
+    public Builder setNoPublish(boolean noPublish) {
+      this.noPublish = noPublish;
+      return this;
+    }
+
+    public Builder setShouldCleanup(boolean shouldCleanup) {
+      this.shouldCleanup = shouldCleanup;
       return this;
     }
 
@@ -198,6 +210,8 @@ public class Prober {
 
   private final String project;
   private final String endpoint;
+  private final boolean shouldCleanup;
+  private final boolean noPublish;
   private final String topicName;
   private final String subscriptionName;
   private final SubscriptionType subscriptionType;
@@ -221,6 +235,7 @@ public class Prober {
   private boolean started;
   private Publisher publisher;
   private final Subscriber[] subscribers;
+  private GrpcSubscriberStub[] pullSubscribers;
   private final Future<?>[] pullSubscriberFutures;
   private TopicAdminClient topicAdminClient;
   private SubscriptionAdminClient subscriptionAdminClient;
@@ -256,9 +271,12 @@ public class Prober {
     this.subscriptionType = builder.subscriptionType;
     this.subscriptionName = builder.subscriptionName;
     this.topicName = builder.topicName;
+    this.shouldCleanup = builder.shouldCleanup;
+    this.noPublish = builder.noPublish;
     this.endpoint = builder.endpoint;
     this.project = builder.project;
     subscribers = new Subscriber[subscriberCount];
+    pullSubscribers = new GrpcSubscriberStub[subscriberCount];
     pullSubscriberFutures = new Future<?>[subscriberCount];
 
     this.r = new Random();
@@ -560,13 +578,14 @@ public class Prober {
     }
   }
 
-  private void doPullIteration(final GrpcSubscriberStub subscriber, int subscriberIndex) {
+  private void doPullIteration(int subscriberIndex) {
     PullRequest pullRequest =
         PullRequest.newBuilder()
             .setSubscription(fullSubscriptionName.toString())
             .setMaxMessages(maxPullMessages)
             .build();
-    ApiFuture<PullResponse> pullResponseFuture = subscriber.pullCallable().futureCall(pullRequest);
+    ApiFuture<PullResponse> pullResponseFuture =
+        pullSubscribers[subscriberIndex].pullCallable().futureCall(pullRequest);
     pullResponseFuture.addListener(
         () -> {
           PullResponse pullResponse = null;
@@ -574,7 +593,7 @@ public class Prober {
             pullResponse = pullResponseFuture.get();
           } catch (InterruptedException | ExecutionException e) {
             logger.log(Level.WARNING, "Could not get pull result.", e);
-            doPullIteration(subscriber, subscriberIndex);
+            doPullIteration(subscriberIndex);
             return;
           }
           List<String> messagesToAck = new ArrayList<>();
@@ -594,7 +613,7 @@ public class Prober {
                     .addAllAckIds(messagesToAck)
                     .build();
 
-            subscriber.acknowledgeCallable().call(acknowledgeRequest);
+            pullSubscribers[subscriberIndex].acknowledgeCallable().call(acknowledgeRequest);
           }
           if (!messagesToNack.isEmpty()) {
             ModifyAckDeadlineRequest modAckRequest =
@@ -603,14 +622,17 @@ public class Prober {
                     .setAckDeadlineSeconds(0)
                     .addAllAckIds(messagesToNack)
                     .build();
-            subscriber.modifyAckDeadlineCallable().call(modAckRequest);
+            pullSubscribers[subscriberIndex].modifyAckDeadlineCallable().call(modAckRequest);
           }
-          doPullIteration(subscriber, subscriberIndex);
+          doPullIteration(subscriberIndex);
         },
         executor);
   }
 
   private void createPullSubscribers() {
+    pullSubscribers = new GrpcSubscriberStub[subscriberCount];
+    logger.log(Level.INFO, "Creating Pull Subscribers");
+
     for (int i = 0; i < subscriberCount; ++i) {
       final int index = i;
       pullSubscriberFutures[i] =
@@ -618,14 +640,16 @@ public class Prober {
               () -> {
                 SubscriberStubSettings.Builder subscriberStubSettings =
                     SubscriberStubSettings.newBuilder().setEndpoint(endpoint);
-                try (final GrpcSubscriberStub subscriber =
-                    GrpcSubscriberStub.create(subscriberStubSettings.build())) {
-                  for (int j = 0; j < pullCount; ++j) {
-                    doPullIteration(subscriber, index);
-                  }
+                try {
+                  pullSubscribers[index] =
+                      GrpcSubscriberStub.create(subscriberStubSettings.build());
+
                 } catch (IOException e) {
                   logger.log(Level.SEVERE, "Could not create pull subscriber.", e);
                   return;
+                }
+                for (int j = 0; j < pullCount; ++j) {
+                  doPullIteration(index);
                 }
               });
     }
@@ -655,12 +679,14 @@ public class Prober {
 
   // Returns true if a topic or subscription was deleted.
   private boolean cleanup() {
+    if (!shouldCleanup) return false;
     boolean deleted = deleteSubscription(fullSubscriptionName);
     deleted = deleted || deleteTopic(fullTopicName);
     return deleted;
   }
 
   private void generatePublishLoad() {
+    if (noPublish) return;
     logger.log(Level.INFO, "Beginning publishing");
     generatePublishesFuture =
         executor.scheduleAtFixedRate(
